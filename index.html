@@ -330,16 +330,60 @@ function renderTable(candles) {
 
 // ── Parse Claude response ─────────────────────────────────────────────────────
 function parse(text) {
-  const get = (...pats) => { for (const p of pats) { const m = text.match(p); if (m) return m[1].replace(/,/g,'').trim(); } return '—'; };
-  const level = get(/KEY LEVEL[:\s*]+([0-9]+\.?[0-9]*)/i, /LEVEL[:\s*]+([0-9]+\.?[0-9]*)/i, /WATCH[:\s*]+([0-9]+\.?[0-9]*)/i);
-  const rm = text.match(/([0-9,]+\.?[0-9]*)\s*[–\-—]+\s*([0-9,]+\.?[0-9]*)/);
-  const sellEntry = get(/(?:RED|SELL|Short)[^]*?Entry[:\s]+([0-9,]+\.?[0-9]*)/i);
-  const sellSL    = get(/(?:RED|SELL|Short)[^]*?(?:SL|Stop Loss)[:\s]+([0-9,]+\.?[0-9]*)/i);
-  const sellTP    = get(/(?:RED|SELL|Short)[^]*?(?:TP|Take Profit)[:\s]+([0-9,]+\.?[0-9]*)/i);
-  const buyEntry  = get(/(?:GREEN|BUY|Long)[^]*?Entry[:\s]+([0-9,]+\.?[0-9]*)/i);
-  const buySL     = get(/(?:GREEN|BUY|Long)[^]*?(?:SL|Stop Loss)[:\s]+([0-9,]+\.?[0-9]*)/i);
-  const buyTP     = get(/(?:GREEN|BUY|Long)[^]*?(?:TP|Take Profit)[:\s]+([0-9,]+\.?[0-9]*)/i);
-  return { level, rm, sell:{e:sellEntry,s:sellSL,t:sellTP}, buy:{e:buyEntry,s:buySL,t:buyTP} };
+  // Extract any price number after a label
+  const getPrice = (...pats) => {
+    for (const p of pats) {
+      const m = text.match(p);
+      if (m) {
+        // grab first price-like number in the match
+        const num = (m[1]||m[0]).replace(/,/g,'').match(/\d{3,4}\.?\d*/);
+        if (num) return num[0];
+      }
+    }
+    return '—';
+  };
+
+  // Split into SELL and BUY sections for cleaner parsing
+  const sellSection = text.split(/BUY|GREEN|🟢/i)[0] || text;
+  const buySection  = text.split(/BUY|GREEN|🟢/i)[1] || text;
+
+  const level = getPrice(
+    /KEY LEVEL[:\s\*]+([^\n]+)/i,
+    /LEVEL TO WATCH[:\s]+([^\n]+)/i,
+    /WATCH[:\s]+([^\n]+)/i,
+    /KEY[:\s]+([^\n]+)/i
+  );
+
+  // Range: find two prices separated by dash/to
+  const rm = text.match(/(\d{3,4}\.?\d*)\s*[–\-—to]+\s*(\d{3,4}\.?\d*)/);
+
+  const sellEntry = getPrice(/Entry[:\s\*]+([^\n]+)/i.exec(sellSection)?.[0] ? /Entry[:\s\*]+([^\n]+)/i : /SELL[^\n]*\n[^\n]*Entry[:\s]+([^\n]+)/i);
+  const sellSL    = getPrice(/(?:SL|Stop Loss)[:\s\*]+([^\n]+)/i.exec(sellSection)?.[0] ? /(?:SL|Stop Loss)[:\s\*]+([^\n]+)/i : /x/);
+  const sellTP    = getPrice(/(?:TP|Take Profit)[:\s\*]+([^\n]+)/i.exec(sellSection)?.[0] ? /(?:TP|Take Profit)[:\s\*]+([^\n]+)/i : /x/);
+
+  // parse sell section specifically
+  const sLines = sellSection.split('\n');
+  let se='—', ss='—', st='—';
+  for (const line of sLines) {
+    const num = line.replace(/,/g,'').match(/\d{3,4}\.?\d*/);
+    if (!num) continue;
+    if (/entry/i.test(line)) se = num[0];
+    else if (/sl|stop/i.test(line)) ss = num[0];
+    else if (/tp|take|profit/i.test(line)) st = num[0];
+  }
+
+  // parse buy section specifically
+  const bLines = (buySection||'').split('\n');
+  let be='—', bs='—', bt='—';
+  for (const line of bLines) {
+    const num = line.replace(/,/g,'').match(/\d{3,4}\.?\d*/);
+    if (!num) continue;
+    if (/entry/i.test(line)) be = num[0];
+    else if (/sl|stop/i.test(line)) bs = num[0];
+    else if (/tp|take|profit/i.test(line)) bt = num[0];
+  }
+
+  return { level, rm, sell:{e:se,s:ss,t:st}, buy:{e:be,s:bs,t:bt} };
 }
 
 function populate(p, raw) {
@@ -393,25 +437,31 @@ async function getSignal() {
 
     setStatus('loading', 'Claude is identifying key levels...');
 
-    const sys = `You are a professional XAUUSD scalping analyst. Analyse candle data and output a signal in EXACTLY this format — no extra text before it:
+    const sys = `You are a professional XAUUSD scalping analyst. You MUST respond in EXACTLY this format with NO deviations, NO markdown, NO bold, NO extra text:
 
-KEY LEVEL: [price]
-RANGE: [level-10] – [level+10]
+KEY LEVEL: 2648.50
+RANGE: 2638.50 – 2658.50
 
-🔴 RED CANDLE CLOSES IN RANGE → SELL
-Entry: [price]
-SL: [price]
-TP: [price]
+RED CANDLE CLOSES IN RANGE - SELL
+Entry: 2637.00
+SL: 2658.50
+TP: 2612.00
 
-🟢 GREEN CANDLE CLOSES IN RANGE → BUY
-Entry: [price]
-SL: [price]
-TP: [price]
+GREEN CANDLE CLOSES IN RANGE - BUY
+Entry: 2660.00
+SL: 2638.50
+TP: 2685.00
 
 ANALYSIS:
-[2-3 sentences max on why this level and what bias is]
+Write 2 sentences here explaining the level and bias.
 
-Rules: SL = 15-20 points from entry. TP = minimum 2:1 RR. Entry = next candle open after signal close. Use exact prices, no approximations.`;
+STRICT RULES:
+- Replace all prices above with real calculated prices from the candle data
+- SL must be 15-20 points from entry
+- TP must be at least 2x the SL distance (2:1 RR minimum)
+- Entry is the next candle open price after signal candle closes
+- Output ONLY the above format, nothing else before or after
+- Do NOT use asterisks, bold, bullet points or any markdown`;
 
     const msg = `Current XAUUSD price: ${latestClose?.toFixed(2)}
 
@@ -425,7 +475,7 @@ Find the next key level price is heading towards. Give the range 10 points above
 
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'application/json','anthropic-dangerous-direct-browser-access':'true'},
       body: JSON.stringify({
         model:'claude-sonnet-4-6',
         max_tokens:800,
